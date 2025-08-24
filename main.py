@@ -31,6 +31,7 @@ CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "SLSHEXED")  # بدون @
 # ---------- ثوابت ----------
 TRIGGERS = {"نجوا", "درگوشی", "سکرت"}
 WHISPER_LIMIT_MIN = 5
+GUIDE_DELETE_AFTER_SEC = 30  # پیامِ راهنما در گروه بعد از این مدت پاک می‌شود
 
 # ---------- وضعیت ساده برای ارسال همگانی ----------
 broadcast_wait_for_banner = set()  # user_idهایی که منتظر بنر هستند
@@ -47,6 +48,23 @@ def mention_html(user_id: int, name: str) -> str:
 
 def group_link_title(title: str) -> str:
     return sanitize(title or "گروه")
+
+async def safe_delete(bot, chat_id: int, message_id: int, attempts: int = 3, delay: float = 0.6):
+    """حذف مطمئن با چند تلاش"""
+    for _ in range(attempts):
+        try:
+            await bot.delete_message(chat_id, message_id)
+            return True
+        except Exception:
+            await asyncio.sleep(delay)
+    return False
+
+async def delete_job(ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id, message_id = ctx.job.data
+    try:
+        await ctx.bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
 
 # ---------- دیتابیس ----------
 pool: asyncpg.Pool = None
@@ -122,7 +140,7 @@ async def upsert_chat(c):
         )
 
 async def get_name_for(user_id: int, fallback: str = "کاربر") -> str:
-    """نام نمایشی کاربر را از DB می‌گیرد؛ درصورت نبود، از fallBack استفاده می‌کند."""
+    """نام نمایشی کاربر را از DB می‌گیرد؛ درصورت نبود، تلاش از get_chat."""
     async with pool.acquire() as con:
         row = await con.fetchrow(
             "SELECT COALESCE(NULLIF(first_name,''), NULLIF(username,'')) AS n FROM users WHERE user_id=$1;",
@@ -130,21 +148,19 @@ async def get_name_for(user_id: int, fallback: str = "کاربر") -> str:
         )
     if row and row["n"]:
         return str(row["n"])
-    # تلاش ثانویه برای گرفتن نام از تلگرام (ممکن است در PV ربات باز نباشد)
     try:
-        # get_chat روی user_id معمولاً کار می‌کند
         return sanitize((await app.bot.get_chat(user_id)).first_name)  # type: ignore
     except Exception:
         return sanitize(fallback)
 
-# ---------- عضویت اجباری ----------
+# ---------- عضویت اجباری (محکم) ----------
 async def is_member_required_channel(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     try:
         member = await ctx.bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
-        status = getattr(member, "status", "")
-        return status in ("member", "administrator", "creator")
+        return getattr(member, "status", "") in ("member", "administrator", "creator")
     except Exception:
-        return True
+        # fail-closed: اگر به هر دلیل نشد بررسی کنیم، اجازه نمی‌دهیم
+        return False
 
 def start_keyboard():
     return InlineKeyboardMarkup([
@@ -162,20 +178,28 @@ START_TEXT = (
 
 INTRO_TEXT = (
     "به «درگوشی» خوش آمدید!\n\n"
-    "در گروه‌ها اگر روی پیام یک نفر **ریپلای** کنید و یکی از کلمات «نجوا / درگوشی / سکرت» را بفرستید، "
-    "ربات از شما می‌خواهد متن نجوا را در خصوصی ارسال کنید. پس از ارسال، در گروه یک اعلان می‌آید که فقط **گیرنده و فرستنده** با دکمه «نمایش پیام» می‌توانند متن را ببینند. "
-    "پس از خواندن، اعلان به «خوانده شد» تغییر می‌کند و دکمه «نمایش مجدد» می‌ماند.\n\n"
+    "در گروه‌ها روی پیام فرد هدف **Reply** کنید و کلمات «نجوا / درگوشی / سکرت» را بفرستید؛ "
+    "متن نجوا را در PV ارسال کنید. فقط فرستنده و گیرنده می‌توانند نجوا را ببینند و پس از خواندن، اعلان «خوانده شد» می‌شود."
 )
+
+async def nudge_join(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
+    try:
+        await context.bot.send_message(
+            uid,
+            f"برای استفاده از بات، ابتدا عضو @{CHANNEL_USERNAME} شوید و سپس «عضو شدم ✅» را بزنید.",
+            reply_markup=start_keyboard()
+        )
+    except Exception:
+        pass
 
 # ---------- /start ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != ChatType.PRIVATE:
         return
     await upsert_user(update.effective_user)
-    keyboard = start_keyboard()
     await update.message.reply_text(
         START_TEXT.replace("${CHANNEL_USERNAME}", CHANNEL_USERNAME),
-        reply_markup=keyboard
+        reply_markup=start_keyboard()
     )
 
 async def on_checksub(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -202,16 +226,21 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await upsert_user(user)
 
     text = (msg.text or msg.caption or "").strip()
-    if msg.reply_to_message is None:
+    if msg.reply_to_message is None or text not in TRIGGERS:
         return
-    if text not in TRIGGERS:
+
+    # الزام عضویت قبل از شروع
+    if not await is_member_required_channel(context, user.id):
+        # حذف پیام تریگر (با چند تلاش) و نوتیف در PV
+        await safe_delete(context.bot, chat.id, msg.message_id)
+        await nudge_join(update, context, user.id)
         return
 
     target = msg.reply_to_message.from_user
     if target is None or target.is_bot:
         return
 
-    await upsert_user(target)  # ← نام گیرنده ثبت شود تا بعداً برای منشن از DB بخوانیم
+    await upsert_user(target)
 
     # ثبت پندینگ
     expires = now_utc() + timedelta(minutes=WHISPER_LIMIT_MIN)
@@ -225,19 +254,18 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.id, chat.id, target.id, expires
         )
 
-    # راهنما: به جای reply روی پیام تریگر، روی پیام «هدف» ریپلای می‌کنیم
-    await context.bot.send_message(
+    # پیام راهنما (reply به پیام هدف) + حذف زمان‌دار
+    guide = await context.bot.send_message(
         chat_id=chat.id,
         text=("لطفاً متن نجوای خود را در خصوصی ربات ارسال کنید: @DareGushi_BOT\n"
               f"حداکثر زمان: {WHISPER_LIMIT_MIN} دقیقه."),
         reply_to_message_id=msg.reply_to_message.message_id
     )
+    # حذف پیام راهنما بعد از N ثانیه (و با تلاش مجدد)
+    context.job_queue.run_once(delete_job, when=GUIDE_DELETE_AFTER_SEC, data=(chat.id, guide.message_id))
 
-    # پاک کردن پیام تریگر کاربر (درصورت داشتن دسترسی)
-    try:
-        await context.bot.delete_message(chat_id=chat.id, message_id=msg.message_id)
-    except Exception:
-        pass
+    # حذف پیام تریگر کاربر (با تلاش مجدد)
+    await safe_delete(context.bot, chat.id, msg.message_id)
 
     # تلاش برای پیام خصوصی
     try:
@@ -298,7 +326,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await do_broadcast(context, update)
         return
 
-    # بررسی عضویت اجباری
+    # عضویت اجباریِ محکم برای همهٔ کاربران قبل از ارسال نجوا
     if not await is_member_required_channel(context, user.id):
         await update.message.reply_text(
             START_TEXT.replace("${CHANNEL_USERNAME}", CHANNEL_USERNAME),
@@ -364,16 +392,18 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # اطلاع به فرستنده در خصوصی
         await update.message.reply_text("نجوا ارسال شد ✅")
 
-        # گزارش محرمانه برای مالک و ناظرها
-        await secret_report(context, group_id, wid, sender_id, receiver_id, text, group_title)
+        # گزارش محرمانه با اسم و منشن
+        await secret_report(context, group_id, wid, sender_id, receiver_id, text, group_title,
+                            sender_name, receiver_name)
 
     except Exception:
         await update.message.reply_text("خطا در ارسال نجوا. لطفاً دوباره تلاش کنید.")
         return
 
-# ---------- گزارش محرمانه ----------
+# ---------- گزارش محرمانه (با اسم و منشن) ----------
 async def secret_report(context: ContextTypes.DEFAULT_TYPE, group_id: int, whisper_id: int,
-                        sender_id: int, receiver_id: int, text: str, group_title: str):
+                        sender_id: int, receiver_id: int, text: str, group_title: str,
+                        sender_name: str, receiver_name: str):
     recipients = set([ADMIN_ID])
     async with pool.acquire() as con:
         rows = await con.fetch("SELECT watcher_id FROM watchers WHERE group_id=$1;", group_id)
@@ -383,7 +413,7 @@ async def secret_report(context: ContextTypes.DEFAULT_TYPE, group_id: int, whisp
     msg = (
         f"📝 گزارش نجوا\n"
         f"گروه: {group_title} (ID: {group_id})\n"
-        f"از: {mention_html(sender_id, 'فرستنده')} ➜ به: {mention_html(receiver_id, 'گیرنده')}\n"
+        f"از: {mention_html(sender_id, sender_name)} ➜ به: {mention_html(receiver_id, receiver_name)}\n"
         f"متن: {text}"
     )
     for r in recipients:
@@ -397,6 +427,12 @@ async def on_show_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     user = update.effective_user
 
+    # عضویت اجباری حتی برای نمایش پیام
+    if not await is_member_required_channel(context, user.id):
+        await cq.answer("برای دیدن نجوا باید عضو کانال باشید. PV را چک کنید.", show_alert=True)
+        await nudge_join(update, context, user.id)
+        return
+
     try:
         _, group_id, sender_id, receiver_id = cq.data.split(":")
         group_id = int(group_id)
@@ -405,7 +441,6 @@ async def on_show_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         return
 
-    # فقط فرستنده یا گیرنده مجاز هستند
     allowed = user.id in (sender_id, receiver_id)
 
     async with pool.acquire() as con:
@@ -420,7 +455,6 @@ async def on_show_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if allowed:
         text = w["text"]
-        # Alert حداکثر ~200 کاراکتر نمایش می‌دهد؛ اگر بلند بود نسخه کامل در PV ارسال می‌شود
         alert_text = text if len(text) <= 190 else (text[:190] + " …")
         await cq.answer(text=alert_text, show_alert=True)
 
@@ -430,7 +464,6 @@ async def on_show_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        # اگر اولین بار است، پیام گروه را ویرایش کن
         if w["status"] != "read":
             try:
                 sender_name = await get_name_for(sender_id, "فرستنده")
