@@ -27,7 +27,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-# کانال‌های اجباری (دوگانه) – بدون @ هم قابل قبول است
+# کانال‌های اجباری (دوگانه)
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "SLSHEXED")
 CHANNEL_USERNAME_2 = os.environ.get("CHANNEL_USERNAME_2", "dr_gooshad")
 
@@ -172,7 +172,7 @@ async def get_name_for(user_id: int, fallback: str = "کاربر") -> str:
     except Exception:
         return sanitize(fallback)
 
-# ---------- عضویت اجباری (چندکاناله، fail-closed) ----------
+# ---------- عضویت اجباری (برای ارسال/شروع؛ نه برای خواندن) ----------
 async def is_member_required_channel(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     try:
         for ch in MANDATORY_CHANNELS:
@@ -187,10 +187,12 @@ def _channels_text():
     return "، ".join([f"@{ch}" for ch in MANDATORY_CHANNELS])
 
 def start_keyboard_pre():
-    # قبل از تایید عضویت: دکمه «عضو شدم» و دکمهٔ Join هر کانال
+    # قبل از تایید عضویت: دکمه «عضو شدم» و دو دکمهٔ ثابت برای کانال‌ها
     rows = [[InlineKeyboardButton("عضو شدم ✅", callback_data="checksub")]]
-    for ch in MANDATORY_CHANNELS:
-        rows.append([InlineKeyboardButton(f"عضویت در @{ch}", url=f"https://t.me/{ch}")])
+    if len(MANDATORY_CHANNELS) >= 1:
+        rows.append([InlineKeyboardButton("عضویت در کانال یک", url=f"https://t.me/{MANDATORY_CHANNELS[0]}")])
+    if len(MANDATORY_CHANNELS) >= 2:
+        rows.append([InlineKeyboardButton("عضویت در کانال دو", url=f"https://t.me/{MANDATORY_CHANNELS[1]}")])
     rows.append([InlineKeyboardButton("افزودن ربات به گروه ➕", url="https://t.me/DareGushi_BOT?startgroup=true")])
     rows.append([InlineKeyboardButton("ارتباط با پشتیبان 👨🏻‍💻", url="https://t.me/SOULSOWNERBOT")])
     return InlineKeyboardMarkup(rows)
@@ -217,6 +219,7 @@ INTRO_TEXT = (
 )
 
 async def nudge_join(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
+    # درخواست عضویت فقط در PV
     try:
         await context.bot.send_message(
             uid,
@@ -262,12 +265,7 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.reply_to_message is None or text not in TRIGGERS:
         return
 
-    # الزام عضویت قبل از شروع نجوا
-    if not await is_member_required_channel(context, user.id):
-        await safe_delete(context.bot, chat.id, msg.message_id)
-        await nudge_join(update, context, user.id)
-        return
-
+    # ✅ دیگر اینجا عضویت را چک نمی‌کنیم؛ تریگر همیشه پذیرفته می‌شود
     target = msg.reply_to_message.from_user
     if target is None or target.is_bot:
         return
@@ -301,7 +299,7 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # حذف پیام تریگر کاربر
     await safe_delete(context.bot, chat.id, msg.message_id)
 
-    # پیام خصوصی به فرستنده
+    # تلاش برای پیام PV به فرستنده (اگر استارت نکرده باشد، صرفاً خطا نادیده گرفته می‌شود)
     try:
         await context.bot.send_message(
             user.id,
@@ -310,7 +308,7 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
     except Exception:
-        pass
+        pass  # پیام عضویت فقط در PV مطالبه می‌شود، نه در گروه
 
 # ---------- دریافت متن نجوا در خصوصی ----------
 async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -360,7 +358,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await do_broadcast(context, update)
         return
 
-    # عضویت اجباری برای «ارسال نجوا»
+    # ✅ عضویت اجباری فقط برای «ارسال نجوا» (نه شروع/خواندن)
     if not await is_member_required_channel(context, user.id):
         await update.message.reply_text(START_TEXT, reply_markup=start_keyboard_pre())
         return
@@ -461,7 +459,7 @@ async def on_show_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     user = update.effective_user
 
-    # طبق خواسته: خواندن نجوا بدون عضویت مجاز است → هیچ چکی اینجا انجام نمی‌دهیم
+    # خواندن نجوا بدون عضویت مجاز است
 
     try:
         _, group_id, sender_id, receiver_id = cq.data.split(":")
