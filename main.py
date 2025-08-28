@@ -21,6 +21,7 @@ from telegram.ext import (
     CommandHandler,
     filters,
 )
+from telegram.error import BadRequest
 import asyncpg
 
 # ---------- Logging ----------
@@ -58,6 +59,9 @@ forward_wait: dict[int, int] = {}
 
 BOT_USERNAME = ""
 BOT_MENTION = ""
+
+# برای get_name_for
+app: Application | None = None
 
 # ---------- Helpers ----------
 def now_utc() -> datetime:
@@ -259,6 +263,7 @@ async def maybe_send_waiting_pm(user_id: int, context: ContextTypes.DEFAULT_TYPE
         )
 
 async def send_pm_or_prompt_in_group(context: ContextTypes.DEFAULT_TYPE, user, group_msg):
+    """تلاش برای ارسال PM؛ اگر نشد، در گروه با منشن و دکمهٔ بازکردن پیوی یادآوری کن."""
     try:
         await context.bot.send_message(
             user.id,
@@ -321,6 +326,7 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (msg.text or msg.caption or "").strip()
 
+    # اگر بدون ریپلای تریگر داد، توضیح بده
     if (msg.reply_to_message is None) and (text in TRIGGERS):
         await msg.reply_text("برای نجوا باید روی پیام هدف «Reply» کنید و سپس یکی از «نجوا / درگوشی / سکرت» را بفرستید.")
         return
@@ -345,18 +351,26 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.id, chat.id, target.id, expires, msg.reply_to_message.message_id
         )
 
-    guide = await context.bot.send_message(
-        chat_id=chat.id,
-        text=(f"لطفاً متن نجوای خود را در پیوی ارسال کنید: {BOT_MENTION}\n"
-              f"مهلت: {WHISPER_LIMIT_MIN} دقیقه."),
-        reply_to_message_id=msg.reply_to_message.message_id
-    )
+    # راهنما: اگر ریپلای شکست خورد، بدون ریپلای بفرست
+    guide_text = (f"لطفاً متن نجوای خود را در پیوی ارسال کنید: {BOT_MENTION}\n"
+                  f"مهلت: {WHISPER_LIMIT_MIN} دقیقه.")
+    try:
+        guide = await context.bot.send_message(
+            chat_id=chat.id,
+            text=guide_text,
+            reply_to_message_id=msg.reply_to_message.message_id
+        )
+    except BadRequest as e:
+        log.warning("guide reply failed: %s — sending without reply", e)
+        guide = await context.bot.send_message(chat_id=chat.id, text=guide_text)
+
     async with pool.acquire() as con:  # type: ignore
         await con.execute("UPDATE pending SET guide_message_id=$1 WHERE sender_id=$2;", guide.message_id, user.id)
 
     context.job_queue.run_once(delete_job, when=GUIDE_DELETE_AFTER_SEC, data=(chat.id, guide.message_id))
     await safe_delete(context.bot, chat.id, msg.message_id)
 
+    # نوتیفِ پیوی (اگر نشد، دکمهٔ بازکردن پیوی در گروه)
     await send_pm_or_prompt_in_group(context, user, msg)
 
 # ---------- Group: @Bot text @username ----------
@@ -556,13 +570,24 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔒 نمایش پیام", callback_data=f"show:{group_id}:{sender_id}:{receiver_id}")]]
         )
-        sent = await context.bot.send_message(
-            chat_id=group_id,
-            text=notify_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-            reply_to_message_id=target_message_id if target_message_id else None
-        )
+
+        # تلاش برای ریپلای روی پیام گیرنده؛ اگر نشد، بدون ریپلای
+        try:
+            sent = await context.bot.send_message(
+                chat_id=group_id,
+                text=notify_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                reply_to_message_id=target_message_id if target_message_id else None
+            )
+        except BadRequest as e:
+            log.warning("notify reply_to %s failed: %s — fallback without reply", target_message_id, e)
+            sent = await context.bot.send_message(
+                chat_id=group_id,
+                text=notify_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard
+            )
 
         async with pool.acquire() as con:  # type: ignore
             await con.fetchval(
@@ -622,6 +647,7 @@ async def on_show_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         return
 
+    # نمایش برای فرستنده/گیرنده/ادمین → بدون چک عضویت
     allowed = (user.id in (sender_id, receiver_id)) or (user.id == ADMIN_ID)
 
     async with pool.acquire() as con:  # type: ignore
@@ -718,9 +744,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_checksub, pattern="^checksub$"))
 
-    # روش سریع باید قبل از تریگر باشد
+    # روش سریع باید قبل از تریگر باشد (Privacy روشن هم کار می‌کند)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT, group_inline_whisper))
-    # روش ریپلای + تریگر (Privacy باید خاموش باشد)
+    # روش ریپلای + تریگر (برای کارکرد کامل، Privacy را در BotFather خاموش کن)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & (~filters.COMMAND), group_trigger))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, any_group_message), group=2)
 
