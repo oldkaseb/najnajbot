@@ -163,6 +163,9 @@ CREATE TABLE IF NOT EXISTS whisper_contacts (
   last_used TIMESTAMPTZ DEFAULT NOW(),
   PRIMARY KEY (owner_id, peer_key)
 );
+
+/* جلوگیری از قاطی شدن: هر message_id در هر گروه فقط یک رکورد */
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_whispers_msg ON whispers(group_id, message_id);
 """
 
 ALTER_SQL = """
@@ -389,29 +392,12 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = (iq.query or "").strip()
     user = iq.from_user
 
-    # شرط عضویت
-    if not await is_member_required_channel(context, user.id):
-        await iq.answer(
-            results=[
-                InlineQueryResultArticle(
-                    id="join",
-                    title="🔒 برای ارسال نجوا عضو شوید",
-                    description=_channels_text(),
-                    input_message_content=InputTextMessageContent("برای ارسال نجوا ابتدا عضو کانال‌ها شوید."),
-                )
-            ],
-            cache_time=1,
-            is_personal=True,
-            switch_pm_text="عضو شدم ✅",
-            switch_pm_parameter="join"
-        )
-        return
-
+    # ✅ دیگر شرط عضویت را برای اینلاین «بلوک‌کننده» نمی‌کنیم.
     results = []
 
-    # @username را در هر جای کوئری پیدا کن (آخرین مورد معتبر)
+    # @username را در هر جای کوئری پیدا کن (آخرین مورد معتبر) — یوزرنیم از ۳ کاراکتر
     uname_match = None
-    for m in re.finditer(r"@([A-Za-z0-9_]{5,})", q):
+    for m in re.finditer(r"@([A-Za-z0-9_]{3,})", q):
         uname_match = m
 
     if uname_match:
@@ -488,9 +474,25 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             thumbnail_width=64,
             thumbnail_height=64,
         )
-        await iq.answer([help_result], cache_time=1, is_personal=True)
-    else:
-        await iq.answer(results, cache_time=0, is_personal=True)
+        results.append(help_result)
+
+    # ℹ️ اگر کاربر عضو نیست، فقط یک کارت اطلاع‌رسانی هم اضافه می‌کنیم (اما نتایج را نمی‌بندیم)
+    try:
+        is_member = await is_member_required_channel(context, user.id)
+    except Exception:
+        is_member = True
+
+    if not is_member:
+        results.insert(0, InlineQueryResultArticle(
+            id="join_info",
+            title="ℹ️ برای نجوای ریپلای عضویت لازم است (اینلاین آزاد است)",
+            description=_channels_text(),
+            input_message_content=InputTextMessageContent(
+                f"راهنما: نجوای اینلاین آزاد است؛ برای ریپلای عضو شوید.\nکانال‌ها: {_channels_text()}"
+            )
+        ))
+
+    await iq.answer(results, cache_time=0, is_personal=True)
 
 # گزارش فوریِ «لحظهٔ ارسال اینلاین»
 async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -871,7 +873,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await do_broadcast(context, update)
         return
 
-    # عضویت برای ارسال نجوا
+    # عضویت برای ارسال نجوا (فقط مسیر ریپلای نیاز دارد که در group_trigger چک شده است)
     if not await is_member_required_channel(context, user.id):
         await update.message.reply_text(START_TEXT, reply_markup=start_keyboard_pre()); return
 
