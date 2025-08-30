@@ -75,7 +75,6 @@ def group_link_title(title: str) -> str:
     return sanitize(title or "گروه")
 
 def avatar_url(label: str) -> str:
-    # آواتار امن عمومی (بدون نیاز به توکن)
     return f"https://api.dicebear.com/7.x/initials/svg?seed={urlquote(label or 'user')}"
 
 async def safe_delete(bot, chat_id: int, message_id: int, attempts: int = 3, delay: float = 0.6):
@@ -87,16 +86,17 @@ async def safe_delete(bot, chat_id: int, message_id: int, attempts: int = 3, del
             await asyncio.sleep(delay)
     return False
 
-async def delete_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id, message_id = context.job.data
+# --- زمان‌بندی بدون JobQueue (با asyncio) ---
+async def _delete_after(bot, chat_id: int, message_id: int, delay_sec: int):
     try:
-        await context.bot.delete_message(chat_id, message_id)
+        await asyncio.sleep(delay_sec)
+        await bot.delete_message(chat_id, message_id)
     except Exception:
         pass
 
-# ✅ هِلپر برای دسترسی امن به JobQueue (رفع خطای context.job_queue = None)
-def _jq(context: ContextTypes.DEFAULT_TYPE):
-    return getattr(context, "job_queue", None) or context.application.job_queue
+def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay_sec: int):
+    # جایگزین run_once(JobQueue)
+    context.application.create_task(_delete_after(context.bot, chat_id, message_id, delay_sec))
 
 # ---------- دیتابیس ----------
 pool: asyncpg.Pool = None
@@ -379,7 +379,7 @@ async def group_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(rows),
         disable_web_page_preview=True
     )
-    _jq(context).run_once(delete_job, when=GUIDE_DELETE_AFTER_SEC, data=(chat.id, sent.message_id))
+    schedule_delete(context, chat.id, sent.message_id, GUIDE_DELETE_AFTER_SEC)
 
 # ---------- Inline Mode ----------
 BOT_USERNAME: str = ""
@@ -393,7 +393,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = (iq.query or "").strip()
     user = iq.from_user
 
-    # ℹ️ اینلاین را بلوکه نکن؛ فقط اگر عضو نیست یک کارت اطلاع‌رسانی اضافه می‌کنیم
+    # ℹ️ اینلاین را بلوکه نکن؛ فقط درصورت عدم عضویت، کارت اطلاع‌رسانی اضافه می‌کنیم
     join_info = None
     try:
         is_member = await is_member_required_channel(context, user.id)
@@ -411,14 +411,13 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     results = []
 
-    # @username را در هر جای کوئری پیدا کن (آخرین مورد معتبر) — (الگوی اصلی حفظ شده)
+    # یوزرنیم 3+ کاراکتری
     uname_match = None
-    for m in re.finditer(r"@([A-Za-z0-9_]{5,})", q):
+    for m in re.finditer(r"@([A-Za-z0-9_]{3,})", q):
         uname_match = m
 
     if uname_match:
         uname = uname_match.group(1).lower()
-        # متن = کل کوئری به‌جز آخرین @username
         text = (q[:uname_match.start()] + q[uname_match.end():]).strip()
 
         rid = await try_resolve_user_id_by_username(context, uname)
@@ -451,7 +450,6 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
     else:
-        # اگر @username نیست → از مخاطبین اخیر پیشنهاد بده (حتی با q خالی)
         recents = await get_recent_contacts(user.id, limit=8)
         base_text = q
         for r in recents:
@@ -479,7 +477,6 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             )
 
-    # اگر هیچ نتیجه‌ای نشد، راهنما بده تا باکس باز شود
     if not results:
         help_result = InlineQueryResultArticle(
             id="help",
@@ -492,13 +489,12 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         results.append(help_result)
 
-    # اگر عضو نبود، کارت اطلاع‌رسانی را به ابتدای نتایج اضافه کن
     if join_info:
         results.insert(0, join_info)
 
     await iq.answer(results, cache_time=0, is_personal=True)
 
-# گزارش فوریِ «لحظهٔ ارسال اینلاین»
+# گزارش فوری «لحظه ارسال اینلاین»
 async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cir = update.chosen_inline_result
     token = cir.result_id
@@ -596,10 +592,8 @@ async def on_inline_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                 await con.execute("UPDATE iwhispers SET reported=TRUE WHERE token=$1;", token)
 
-            # ذخیره در مخاطبین اخیر
             await upsert_contact(sender_id, int(rid) if rid else None, run_final, receiver_name if rid else (run_final or "کاربر"))
 
-            # گزارش کامل برای ادمین و واچرهای همان گروه (فقط پس از نمایش)
             await secret_report(
                 context,
                 group_id=group_id,
@@ -640,7 +634,7 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if msg.reply_to_message is None:
         warn = await msg.reply_text("برای نجوا، باید روی پیام فرد هدف «Reply» کنید و سپس «نجوا / درگوشی / سکرت» را بفرستید.")
-        _jq(context).run_once(delete_job, when=20, data=(chat.id, warn.message_id))
+        schedule_delete(context, chat.id, warn.message_id, 20)
         return
 
     target = msg.reply_to_message.from_user
@@ -649,7 +643,7 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await upsert_user(target)
 
-    # پندینگ بدون انقضا + ذخیره‌ی آیدی پیامِ هدف برای ریپلایِ اعلان نهایی
+    # پندینگ بدون انقضا + ذخیره‌ی آیدی پیام هدف
     async with pool.acquire() as con:
         await con.execute(
             """INSERT INTO pending (sender_id, group_id, receiver_id, created_at, expires_at, guide_message_id, reply_to_msg_id)
@@ -660,7 +654,6 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.id, chat.id, target.id, FAR_FUTURE, msg.reply_to_message.message_id
         )
 
-    # مخاطب اخیر برای پیشنهاد اینلاین
     await upsert_contact(user.id, target.id, target.username or None, target.first_name or None)
 
     member_ok = await is_member_required_channel(context, user.id)
@@ -678,7 +671,7 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_to_message_id=msg.reply_to_message.message_id,
             reply_markup=InlineKeyboardMarkup(rows)
         )
-        _jq(context).run_once(delete_job, when=GUIDE_DELETE_AFTER_SEC, data=(chat.id, m.message_id))
+        schedule_delete(context, chat.id, m.message_id, GUIDE_DELETE_AFTER_SEC)
         await safe_delete(context.bot, chat.id, msg.message_id)
         return
 
@@ -691,7 +684,7 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with pool.acquire() as con:
         await con.execute("UPDATE pending SET guide_message_id=$1 WHERE sender_id=$2;", guide.message_id, user.id)
 
-    _jq(context).run_once(delete_job, when=GUIDE_DELETE_AFTER_SEC, data=(chat.id, guide.message_id))
+    schedule_delete(context, chat.id, guide.message_id, GUIDE_DELETE_AFTER_SEC)
     await safe_delete(context.bot, chat.id, msg.message_id)
 
     try:
@@ -877,7 +870,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await do_broadcast(context, update)
         return
 
-    # عضویت برای ارسال نجوا
+    # عضویت برای ارسال نجوا (مسیر ریپلای)
     if not await is_member_required_channel(context, user.id):
         await update.message.reply_text(START_TEXT, reply_markup=start_keyboard_pre()); return
 
@@ -900,7 +893,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     guide_message_id = int(row["guide_message_id"]) if row["guide_message_id"] else None
     reply_to_msg_id = int(row["reply_to_msg_id"]) if row["reply_to_msg_id"] else None
 
-    # حذف پندینگ پس از استفاده
+    # حذف پندینگ
     async with pool.acquire() as con:
         await con.execute("DELETE FROM pending WHERE sender_id=$1;", sender_id)
 
@@ -922,7 +915,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 group_id, sender_id, receiver_id, text
             )
 
-        # 2) ارسال اعلان گروه با منشن «واقعی» و ریپلای روی پیام هدف
+        # 2) اعلان گروه + دکمه
         notify_text = (
             f"{mention_html(receiver_id, receiver_name)} | شما یک نجوا دارید! \n"
             f"👤 از طرف: {mention_html(sender_id, sender_name)}"
@@ -936,7 +929,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_to_message_id=reply_to_msg_id
         )
 
-        # 3) ثبت message_id همان رکورد
+        # 3) ثبت message_id
         async with pool.acquire() as con:
             await con.execute("UPDATE whispers SET message_id=$1 WHERE id=$2;", sent.message_id, w_id)
 
@@ -944,13 +937,13 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         run = await get_username_for(receiver_id) or None
         await upsert_contact(sender_id, receiver_id, run, receiver_name)
 
-        # پاک کردن راهنما اگر هست
+        # پاک کردن راهنمای قبلی اگر هست
         if guide_message_id:
             await safe_delete(context.bot, group_id, guide_message_id)
 
         await update.message.reply_text("نجوا ارسال شد ✅")
 
-        # گزارش داخلی (کامل)
+        # گزارش داخلی
         await secret_report(context, group_id, sender_id, receiver_id, text, group_title,
                             sender_name, receiver_name, origin="reply")
 
@@ -988,7 +981,7 @@ async def secret_report(context: ContextTypes.DEFAULT_TYPE, group_id: int,
         except Exception:
             pass
 
-# ---------- نمایش پیام (نسخه جدید با id) ----------
+# ---------- نمایش پیام (id جدید) ----------
 async def on_show_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     user = update.effective_user
@@ -1024,8 +1017,6 @@ async def on_show_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- نمایش پیام (سازگاری قدیمی) ----------
 async def on_show_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پشتیبانی از دکمه‌های قدیمی: show:group:sender:receiver
-    با فیلتر message_id همان پیام تا قاطی نشود."""
     cq = update.callback_query
     user = update.effective_user
 
@@ -1137,7 +1128,6 @@ async def any_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await upsert_chat(update.effective_chat, active=True)
         if update.effective_user:
             await upsert_user(update.effective_user)
-        # اگر روی کسی ریپلای شده، او را به مخاطبین اخیر اضافه کن
         msg = update.effective_message
         if msg and msg.reply_to_message and msg.reply_to_message.from_user and not msg.reply_to_message.from_user.is_bot:
             owner = update.effective_user
