@@ -94,6 +94,10 @@ async def delete_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+# ✅ هِلپر برای دسترسی امن به JobQueue (رفع خطای context.job_queue = None)
+def _jq(context: ContextTypes.DEFAULT_TYPE):
+    return getattr(context, "job_queue", None) or context.application.job_queue
+
 # ---------- دیتابیس ----------
 pool: asyncpg.Pool = None
 
@@ -163,9 +167,6 @@ CREATE TABLE IF NOT EXISTS whisper_contacts (
   last_used TIMESTAMPTZ DEFAULT NOW(),
   PRIMARY KEY (owner_id, peer_key)
 );
-
-/* جلوگیری از قاطی شدن: هر message_id در هر گروه فقط یک رکورد */
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_whispers_msg ON whispers(group_id, message_id);
 """
 
 ALTER_SQL = """
@@ -378,7 +379,7 @@ async def group_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(rows),
         disable_web_page_preview=True
     )
-    context.job_queue.run_once(delete_job, when=GUIDE_DELETE_AFTER_SEC, data=(chat.id, sent.message_id))
+    _jq(context).run_once(delete_job, when=GUIDE_DELETE_AFTER_SEC, data=(chat.id, sent.message_id))
 
 # ---------- Inline Mode ----------
 BOT_USERNAME: str = ""
@@ -392,12 +393,27 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = (iq.query or "").strip()
     user = iq.from_user
 
-    # ✅ دیگر شرط عضویت را برای اینلاین «بلوک‌کننده» نمی‌کنیم.
+    # ℹ️ اینلاین را بلوکه نکن؛ فقط اگر عضو نیست یک کارت اطلاع‌رسانی اضافه می‌کنیم
+    join_info = None
+    try:
+        is_member = await is_member_required_channel(context, user.id)
+    except Exception:
+        is_member = True
+    if not is_member:
+        join_info = InlineQueryResultArticle(
+            id="join_info",
+            title="ℹ️ عضویت فقط برای ریپلای لازم است (اینلاین آزاد است)",
+            description=_channels_text(),
+            input_message_content=InputTextMessageContent(
+                f"راهنما: نجوای اینلاین آزاد است؛ برای ریپلای عضو شوید.\nکانال‌ها: {_channels_text()}"
+            )
+        )
+
     results = []
 
-    # @username را در هر جای کوئری پیدا کن (آخرین مورد معتبر) — یوزرنیم از ۳ کاراکتر
+    # @username را در هر جای کوئری پیدا کن (آخرین مورد معتبر) — (الگوی اصلی حفظ شده)
     uname_match = None
-    for m in re.finditer(r"@([A-Za-z0-9_]{3,})", q):
+    for m in re.finditer(r"@([A-Za-z0-9_]{5,})", q):
         uname_match = m
 
     if uname_match:
@@ -476,21 +492,9 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         results.append(help_result)
 
-    # ℹ️ اگر کاربر عضو نیست، فقط یک کارت اطلاع‌رسانی هم اضافه می‌کنیم (اما نتایج را نمی‌بندیم)
-    try:
-        is_member = await is_member_required_channel(context, user.id)
-    except Exception:
-        is_member = True
-
-    if not is_member:
-        results.insert(0, InlineQueryResultArticle(
-            id="join_info",
-            title="ℹ️ برای نجوای ریپلای عضویت لازم است (اینلاین آزاد است)",
-            description=_channels_text(),
-            input_message_content=InputTextMessageContent(
-                f"راهنما: نجوای اینلاین آزاد است؛ برای ریپلای عضو شوید.\nکانال‌ها: {_channels_text()}"
-            )
-        ))
+    # اگر عضو نبود، کارت اطلاع‌رسانی را به ابتدای نتایج اضافه کن
+    if join_info:
+        results.insert(0, join_info)
 
     await iq.answer(results, cache_time=0, is_personal=True)
 
@@ -636,7 +640,7 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if msg.reply_to_message is None:
         warn = await msg.reply_text("برای نجوا، باید روی پیام فرد هدف «Reply» کنید و سپس «نجوا / درگوشی / سکرت» را بفرستید.")
-        context.job_queue.run_once(delete_job, when=20, data=(chat.id, warn.message_id))
+        _jq(context).run_once(delete_job, when=20, data=(chat.id, warn.message_id))
         return
 
     target = msg.reply_to_message.from_user
@@ -674,7 +678,7 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_to_message_id=msg.reply_to_message.message_id,
             reply_markup=InlineKeyboardMarkup(rows)
         )
-        context.job_queue.run_once(delete_job, when=GUIDE_DELETE_AFTER_SEC, data=(chat.id, m.message_id))
+        _jq(context).run_once(delete_job, when=GUIDE_DELETE_AFTER_SEC, data=(chat.id, m.message_id))
         await safe_delete(context.bot, chat.id, msg.message_id)
         return
 
@@ -687,7 +691,7 @@ async def group_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with pool.acquire() as con:
         await con.execute("UPDATE pending SET guide_message_id=$1 WHERE sender_id=$2;", guide.message_id, user.id)
 
-    context.job_queue.run_once(delete_job, when=GUIDE_DELETE_AFTER_SEC, data=(chat.id, guide.message_id))
+    _jq(context).run_once(delete_job, when=GUIDE_DELETE_AFTER_SEC, data=(chat.id, guide.message_id))
     await safe_delete(context.bot, chat.id, msg.message_id)
 
     try:
@@ -873,7 +877,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await do_broadcast(context, update)
         return
 
-    # عضویت برای ارسال نجوا (فقط مسیر ریپلای نیاز دارد که در group_trigger چک شده است)
+    # عضویت برای ارسال نجوا
     if not await is_member_required_channel(context, user.id):
         await update.message.reply_text(START_TEXT, reply_markup=start_keyboard_pre()); return
 
